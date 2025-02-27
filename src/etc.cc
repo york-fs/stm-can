@@ -1,6 +1,7 @@
 #include <can.hh>
 #include <config.hh>
 #include <dti.hh>
+#include <etc_logic.hh>
 #include <hal.hh>
 #include <stm32f103xb.h>
 
@@ -72,6 +73,8 @@ enum class State {
 std::array<std::uint16_t, 2> s_adc_buffer{};
 std::array<std::uint32_t, static_cast<std::uint32_t>(LedState::On) * 2u> s_led_dma{};
 
+etc::CalibrationData s_left_cal;
+
 CalibrationData s_left_calibration;
 CalibrationData s_right_calibration;
 std::atomic<LedState> s_led_state{LedState::Off};
@@ -127,14 +130,20 @@ std::uint32_t CalibrationData::update(std::uint16_t adc_value) {
     ring_buffer[ring_index] = adc_value;
     ring_index = (ring_index + 1) % ring_buffer.size();
 
-    std::uint32_t average = 0;
-    for (std::uint16_t value : ring_buffer) {
-        average += static_cast<std::uint32_t>(value);
-    }
+    std::uint32_t average = std::accumulate(ring_buffer.begin(), ring_buffer.end(), 0u);
     return average / ring_buffer.size();
 }
 
+bool s_main_cal_done = false;
+
 bool calibration_iteration() {
+    return s_left_cal.update_calibration(s_adc_buffer[0]);
+    
+    bool foo = true;
+    if (!s_main_cal_done) {
+        foo = s_left_cal.update_calibration(s_adc_buffer[0]);
+    }
+    
     const auto left_now = static_cast<std::int32_t>(s_adc_buffer[0]);
     const auto right_now = static_cast<std::int32_t>(s_adc_buffer[1]);
     const auto left_average = s_left_calibration.update(s_adc_buffer[0]);
@@ -155,7 +164,7 @@ bool calibration_iteration() {
     for (std::uint16_t value : s_left_calibration.ring_buffer) {
         s_left_calibration.min_value = std::min(s_left_calibration.min_value, value);
     }
-    return true;
+    return foo;
 }
 
 std::uint16_t calculate_current() {
@@ -165,14 +174,17 @@ std::uint16_t calculate_current() {
     normalised = 1.0f - normalised;
     float curve = 1.0f / (1.0f + std::exp(-10.0f * (normalised - 0.5f)));
     auto current = static_cast<std::uint16_t>(curve * 1000.0f);
+
+    return current;
+    
     if (current < 20) {
         return 0;
     }
 
     // Apply current preload if needed.
     const auto rpm = s_dti_state.erpm() / config::k_erpm_factor;
-    if (rpm < 100) {
-        current = std::max(current, static_cast<std::uint16_t>(100 - rpm));
+    if (rpm < 150) {
+        current = std::max(current, static_cast<std::uint16_t>(150 - rpm));
     }
     return current;
 }
@@ -185,6 +197,8 @@ extern "C" void EXTI15_10_IRQHandler() {
     if ((pending & EXTI_PR_PR14) != 0u) {
         const auto current_state = s_state.load();
         if (current_state == State::Uncalibrated || current_state == State::Running) {
+            s_left_cal = {};
+            s_main_cal_done = false;
             s_left_calibration = {};
             s_right_calibration = {};
             s_state.store(State::Calibrating);
@@ -228,6 +242,9 @@ extern "C" void TIM3_IRQHandler() {
     case State::Calibrating:
         set_led_state(LedState::Calibrating);
         if (calibration_iteration()) {
+            hal::swd_printf("cal1: [%u, %u]\n", s_left_calibration.min_value, s_left_calibration.max_value);
+            hal::swd_printf("cal2: [%u, %u]\n", s_left_cal.min_value(), s_left_cal.max_value());
+            
             s_state.store(State::CalibrationWait);
         }
         break;
@@ -241,7 +258,9 @@ extern "C" void TIM3_IRQHandler() {
     case State::Running:
         set_led_state(LedState::Off);
         const auto current = calculate_current();
-        hal::swd_printf("Current: %u, ERPM: %d\n", current, s_dti_state.erpm());
+        const auto current1 = s_left_cal.map_value(s_adc_buffer[0]);
+        
+        hal::swd_printf("Current: [%u, %u], ERPM: %d, adc: %u\n", current, current1, s_dti_state.erpm(), s_adc_buffer[0]);
         can::transmit(dti::build_set_relative_current(config::k_dti_can_id, static_cast<std::int16_t>(current)));
         break;
     }
