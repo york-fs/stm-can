@@ -68,7 +68,7 @@ void spi_transfer(const hal::Gpio &cs, std::span<std::uint8_t> data) {
     hal::wait_equal(SPI2->SR, SPI_SR_BSY, 0u);
 }
 
-void afe_transfer(std::uint16_t balance_bits, std::uint8_t control_bits) {
+bool afe_transfer(std::uint16_t balance_bits, std::uint8_t control_bits) {
     std::array<std::uint8_t, 3> data{
         static_cast<std::uint8_t>(balance_bits >> 8u),
         static_cast<std::uint8_t>(balance_bits),
@@ -86,9 +86,7 @@ void afe_transfer(std::uint16_t balance_bits, std::uint8_t control_bits) {
         // TODO: Return AFE error.
     }
 
-    (data[2] & 0b10u) != 0u;
-
-    hal::swd_printf("[0x%x, 0x%x, 0x%x]\n", data[0], data[1], data[2]);
+    return (data[2] & 0b10u) != 0u;
 }
 
 } // namespace
@@ -143,99 +141,70 @@ void app_main() {
         RCC->APB1ENR |= RCC_APB1ENR_SPI2EN;
         SPI2->CR1 = SPI_CR1_SSM | SPI_CR1_SSI | SPI_CR1_SPE | SPI_CR1_BR_1 | SPI_CR1_MSTR;
 
-        for (std::uint32_t i = 0;; i++) {
-            hal::swd_printf("%u: ", i);
-            afe_transfer(0, 0);
+        std::uint32_t afe_count = 0;
+        while (afe_transfer(0, 0)) {
+            afe_count++;
             for (std::uint32_t i = 0; i < 2000; i++) {
                 __NOP();
             }
         }
 
-        // Initial AFE transfer to start sampling.
-        // TODO: Check OT and product bits.
-        {
-            std::array<std::uint8_t, 3> data{
-                0,
-                0,
-                0b010,
-            };
-            spi_transfer(s_afe_cs, data);
-            hal::swd_printf("AFE initial data: [0x%x, 0x%x, 0x%x]\n", data[0], data[1], data[2]);
-        }
-
         // Wait 60 ms for sampling.
-        for (std::uint32_t i = 0; i < 120000; i++) {
+        for (std::uint32_t i = 0; i < 120000 * 20; i++) {
             __NOP();
         }
 
-        // Hold voltages.
-        // TODO: Check C[1, 12], UV_VA, UV_VP, RDY, OT bits.
-        {
-            std::array<std::uint8_t, 3> data{
-                0,
-                0,
-                0b110,
-            };
-            spi_transfer(s_afe_cs, data);
-        }
+        while (true) {
+            for (std::uint32_t cell = 12; cell > 0; cell--) {
+                std::array<std::uint8_t, 3> data{
+                    0,
+                    0,
+                    0b10000000,
+                };
+                spi_transfer(s_afe_cs, data);
 
-        // Wait for level shift (50 us).
-        for (std::uint32_t i = 0; i < 100; i++) {
-            __NOP();
-        }
+                data[0] = 0;
+                data[1] = 0;
+                data[2] = cell_selection_bits(cell - 1) | 0b100;
+                spi_transfer(s_afe_cs, data);
 
-        for (std::uint32_t cell = 12; cell > 0; cell--) {
-            std::array<std::uint8_t, 3> data{
-                0,
-                0,
-                0b10000100,
-            };
-            // spi_transfer(s_afe_cs, data);
+                // Wait for level shift and AOUT settle (10 us).
+                for (std::uint32_t i = 0; i < 100; i++) {
+                    __NOP();
+                }
 
-            data[0] = 0;
-            data[1] = 0;
-            data[2] = cell_selection_bits(cell - 1) | 0b100;
-            spi_transfer(s_afe_cs, data);
+                // Sample ADC.
+                std::array<std::uint16_t, 8> adc_values{};
+                for (auto &value : adc_values) {
+                    // Trigger conversion.
+                    hal::gpio_reset(s_adc_cs);
+                    hal::gpio_set(s_adc_cs);
 
-            // Wait for AOUT settle (10 us).
-            for (std::uint32_t i = 0; i < 20; i++) {
+                    // Wait minimum conversion time.
+                    for (std::uint32_t i = 0; i < 20; i++) {
+                        __NOP();
+                    }
+
+                    std::array<std::uint8_t, 2> spi_data{};
+                    spi_transfer(s_adc_cs, spi_data);
+                    value = (static_cast<std::uint16_t>(spi_data[0]) << 8u) | spi_data[1];
+                }
+
+                std::uint16_t min_adc = UINT16_MAX;
+                std::uint16_t max_adc = 0;
+                for (auto value : adc_values) {
+                    min_adc = std::min(min_adc, value);
+                    max_adc = std::max(max_adc, value);
+                }
+
+                const auto min_voltage = (min_adc * 45000u) >> 16u;
+                const auto max_voltage = (max_adc * 45000u) >> 16u;
+                hal::swd_printf("v%u: [%u, %u, %u]\n", cell, min_voltage, max_voltage, max_voltage - min_voltage);
+            }
+
+            for (std::uint32_t i = 0; i < 1200000; i++) {
                 __NOP();
             }
-
-            // Sample ADC.
-            std::array<std::uint16_t, 8> adc_values{};
-            for (auto &value : adc_values) {
-                // Trigger conversion.
-                hal::gpio_reset(s_adc_cs);
-                hal::gpio_set(s_adc_cs);
-
-                // Wait minimum conversion time.
-                for (std::uint32_t i = 0; i < 20; i++) {
-                    __NOP();
-                }
-
-                std::array<std::uint8_t, 2> spi_data{};
-                spi_transfer(s_adc_cs, spi_data);
-                value = (static_cast<std::uint16_t>(spi_data[0]) << 8u) | spi_data[1];
-
-                for (std::uint32_t i = 0; i < 20000; i++) {
-                    __NOP();
-                }
-            }
-
-            std::uint16_t min_adc = UINT16_MAX;
-            std::uint16_t max_adc = 0;
-            for (auto value : adc_values) {
-                min_adc = std::min(min_adc, value);
-                max_adc = std::max(max_adc, value);
-            }
-
-            const auto min_voltage = (min_adc * 45000u) >> 16u;
-            const auto max_voltage = (max_adc * 45000u) >> 16u;
-            hal::swd_printf("v%u: [%u, %u, %u]\n", cell, min_voltage, max_voltage, max_voltage - min_voltage);
         }
-
-        hal::gpio_reset(s_led);
-        break;
     }
 }
