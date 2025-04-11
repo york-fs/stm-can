@@ -7,6 +7,9 @@
 
 namespace {
 
+// MAX14920 product and die version bits.
+constexpr std::uint8_t k_afe_version_bits = 0b1010;
+
 class CsGuard {
     hal::Gpio m_pin;
 
@@ -32,6 +35,7 @@ std::array s_thermistor_enable{
     hal::Gpio(hal::GpioPort::A, 6), hal::Gpio(hal::GpioPort::A, 7),
 };
 
+hal::Gpio s_ref_en(hal::GpioPort::B, 1);
 hal::Gpio s_led(hal::GpioPort::B, 5);
 hal::Gpio s_scl(hal::GpioPort::B, 6);
 hal::Gpio s_sda(hal::GpioPort::B, 7);
@@ -45,18 +49,6 @@ hal::Gpio s_mosi(hal::GpioPort::B, 15);
 std::uint8_t cell_selection_bits(std::uint8_t index) {
     return std::array<std::uint8_t, 12>{0b10000000, 0b11000000, 0b10100000, 0b11100000, 0b10010000, 0b11010000,
                                         0b10110000, 0b11110000, 0b10001000, 0b11001000, 0b10101000, 0b11101000}[index];
-}
-
-[[gnu::noinline]] void wfe() {
-    __WFE();
-    __NOP();
-}
-
-void enter_stop_mode() {
-    SCB->SCR |= SCB_SCR_SLEEPDEEP_Msk;
-    __SEV();
-    wfe();
-    wfe();
 }
 
 void spi_transfer(const hal::Gpio &cs, std::span<std::uint8_t> data) {
@@ -76,6 +68,29 @@ void spi_transfer(const hal::Gpio &cs, std::span<std::uint8_t> data) {
     hal::wait_equal(SPI2->SR, SPI_SR_BSY, 0u);
 }
 
+void afe_transfer(std::uint16_t balance_bits, std::uint8_t control_bits) {
+    std::array<std::uint8_t, 3> data{
+        static_cast<std::uint8_t>(balance_bits >> 8u),
+        static_cast<std::uint8_t>(balance_bits),
+        control_bits,
+    };
+    spi_transfer(s_afe_cs, data);
+
+    // Check version bits are correct.
+    if ((data[2] >> 4u) != k_afe_version_bits) {
+        // TODO: Return SPI communication error.
+    }
+
+    // Check UVLO and thermal shutdown bits.
+    if ((data[2] & 0b1101u) != 0u) {
+        // TODO: Return AFE error.
+    }
+
+    (data[2] & 0b10u) != 0u;
+
+    hal::swd_printf("[0x%x, 0x%x, 0x%x]\n", data[0], data[1], data[2]);
+}
+
 } // namespace
 
 bool hal_low_power() {
@@ -88,6 +103,7 @@ void app_main() {
     for (const auto &gpio : s_thermistor_enable) {
         gpio.configure(hal::GpioOutputMode::PushPull, hal::GpioOutputSpeed::Max2);
     }
+    s_ref_en.configure(hal::GpioOutputMode::PushPull, hal::GpioOutputSpeed::Max2);
     s_led.configure(hal::GpioOutputMode::PushPull, hal::GpioOutputSpeed::Max2);
     s_afe_en.configure(hal::GpioOutputMode::PushPull, hal::GpioOutputSpeed::Max2);
 
@@ -106,18 +122,18 @@ void app_main() {
         s_sck.configure(hal::GpioOutputMode::PushPull, hal::GpioOutputSpeed::Max2);
         s_mosi.configure(hal::GpioOutputMode::PushPull, hal::GpioOutputSpeed::Max2);
 
-        // Pull CS lines high by default (active-low) and put ADC and AFE into shutdown.
+        // Pull CS lines high by default (active-low) and put the ADC, AFE, and reference into shutdown.
         hal::gpio_set(s_adc_cs, s_afe_cs, s_sck);
-        hal::gpio_reset(s_adc_cs, s_afe_en);
+        hal::gpio_reset(s_adc_cs, s_afe_en, s_ref_en);
         hal::gpio_set(s_adc_cs);
 
         // Reconfigure SCL as a regular input for use as an external event and enter stop mode.
         s_scl.configure(hal::GpioInputMode::Floating);
-        enter_stop_mode();
+        hal::enter_stop_mode();
 
-        // Wake ADC and enable AFE.
+        // Wake the ADC and enable the AFE and reference.
         hal::gpio_reset(s_sck, s_adc_cs);
-        hal::gpio_set(s_adc_cs, s_afe_cs, s_afe_en, s_led);
+        hal::gpio_set(s_adc_cs, s_afe_cs, s_afe_en, s_ref_en);
 
         // Configure SCK and MOSI for use with SPI peripheral.
         s_sck.configure(hal::GpioOutputMode::AlternatePushPull, hal::GpioOutputSpeed::Max10);
@@ -127,10 +143,22 @@ void app_main() {
         RCC->APB1ENR |= RCC_APB1ENR_SPI2EN;
         SPI2->CR1 = SPI_CR1_SSM | SPI_CR1_SSI | SPI_CR1_SPE | SPI_CR1_BR_1 | SPI_CR1_MSTR;
 
+        for (std::uint32_t i = 0;; i++) {
+            hal::swd_printf("%u: ", i);
+            afe_transfer(0, 0);
+            for (std::uint32_t i = 0; i < 2000; i++) {
+                __NOP();
+            }
+        }
+
         // Initial AFE transfer to start sampling.
         // TODO: Check OT and product bits.
         {
-            std::array<std::uint8_t, 3> data{};
+            std::array<std::uint8_t, 3> data{
+                0,
+                0,
+                0b010,
+            };
             spi_transfer(s_afe_cs, data);
             hal::swd_printf("AFE initial data: [0x%x, 0x%x, 0x%x]\n", data[0], data[1], data[2]);
         }
@@ -145,8 +173,8 @@ void app_main() {
         {
             std::array<std::uint8_t, 3> data{
                 0,
-                0b00000000,
-                0b00000100,
+                0,
+                0b110,
             };
             spi_transfer(s_afe_cs, data);
         }
@@ -158,11 +186,11 @@ void app_main() {
 
         for (std::uint32_t cell = 12; cell > 0; cell--) {
             std::array<std::uint8_t, 3> data{
-                0b00000000,
-                0b00000000,
-                0b10000000,
+                0,
+                0,
+                0b10000100,
             };
-            spi_transfer(s_afe_cs, data);
+            // spi_transfer(s_afe_cs, data);
 
             data[0] = 0;
             data[1] = 0;
@@ -189,6 +217,10 @@ void app_main() {
                 std::array<std::uint8_t, 2> spi_data{};
                 spi_transfer(s_adc_cs, spi_data);
                 value = (static_cast<std::uint16_t>(spi_data[0]) << 8u) | spi_data[1];
+
+                for (std::uint32_t i = 0; i < 20000; i++) {
+                    __NOP();
+                }
             }
 
             std::uint16_t min_adc = UINT16_MAX;
@@ -198,11 +230,12 @@ void app_main() {
                 max_adc = std::max(max_adc, value);
             }
 
-            const auto min_voltage = (min_adc * 40960u) >> 16u;
-            const auto max_voltage = (max_adc * 40960u) >> 16u;
+            const auto min_voltage = (min_adc * 45000u) >> 16u;
+            const auto max_voltage = (max_adc * 45000u) >> 16u;
             hal::swd_printf("v%u: [%u, %u, %u]\n", cell, min_voltage, max_voltage, max_voltage - min_voltage);
         }
 
         hal::gpio_reset(s_led);
+        break;
     }
 }
