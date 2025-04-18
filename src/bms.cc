@@ -1,52 +1,39 @@
+#include <bms_i2c.hh>
 #include <hal.hh>
 #include <stm32f103xb.h>
+#include <util.hh>
 
 #include <array>
 #include <bit>
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <optional>
+#include <tuple>
 #include <utility>
 
 namespace {
 
-// MAX14920 product and die version bits.
-constexpr std::uint8_t k_afe_version_bits = 0b1010;
-
-// Number of ADC samples to perform for voltage measurement.
-constexpr std::uint32_t k_adc_sample_count = 8;
+// Number of ADC samples to perform for rail voltage, cell voltage, and thermistor measurements respectively.
+constexpr std::size_t k_rail_sample_count = 16384;
+constexpr std::size_t k_cell_sample_count = 64;
+constexpr std::size_t k_thermistor_sample_count = 8;
 
 // Maximum number of connected thermistors, including the onboard ones.
-constexpr std::uint32_t k_max_thermistor_count = 23;
+constexpr std::size_t k_max_thermistor_count = 23;
 
 // Voltage threshold from the absolute endpoints (0 and Vref) in 100 uV resolution from when to consider a thermistor as
 // being either open or short circuit.
 constexpr std::uint32_t k_thermistor_range_threshold = 5000;
+
+// MAX14920 product and die version bits.
+constexpr std::uint8_t k_afe_version_bits = 0b1010;
 
 enum class AfeStatus {
     Ready,
     NotReady,
     BadSpi,
     Shutdown,
-};
-
-class CsGuard {
-    hal::Gpio m_pin;
-
-public:
-    explicit CsGuard(hal::Gpio pin) : m_pin(pin) {
-        // Pull CS low.
-        hal::gpio_reset(pin);
-    }
-    CsGuard(const CsGuard &) = delete;
-    CsGuard(CsGuard &&) = delete;
-    ~CsGuard() {
-        // Pull CS high again.
-        hal::gpio_set(m_pin);
-    }
-
-    CsGuard &operator=(const CsGuard &) = delete;
-    CsGuard &operator=(CsGuard &&) = delete;
 };
 
 std::array s_thermistor_enable{
@@ -67,21 +54,82 @@ hal::Gpio s_sck(hal::GpioPort::B, 13);
 hal::Gpio s_miso(hal::GpioPort::B, 14);
 hal::Gpio s_mosi(hal::GpioPort::B, 15);
 
-void spi_transfer(const hal::Gpio &cs, std::span<std::uint8_t> data) {
+bms::I2cResponse s_data{};
+
+std::optional<bms::Request> i2c_receive() {
     // TODO: Add timeouts.
-    CsGuard cs_guard(cs);
+    if ((I2C1->SR1 & I2C_SR1_ADDR) == 0u) {
+        // Address not matched.
+        return std::nullopt;
+    }
+
+    // Clear address matched status by reading SR2.
+    const std::uint32_t sr2 = I2C1->SR2;
+
+    // Check if master sending a command.
+    if ((sr2 & I2C_SR2_TRA) == 0u) {
+        // Receive the single command byte.
+        while ((I2C1->SR1 & I2C_SR1_RXNE) == 0u) {
+            __NOP();
+        }
+        return static_cast<bms::Request>(I2C1->DR);
+    }
+
+    // Otherwise master wants to read our data.
+    std::uint32_t index = 0;
+    while ((I2C1->SR1 & I2C_SR1_STOPF) == 0u) {
+        if ((I2C1->SR1 & I2C_SR1_AF) != 0u) {
+            // NACK received.
+            I2C1->SR1 &= ~I2C_SR1_AF;
+            break;
+        }
+
+        if ((I2C1->SR1 & I2C_SR1_TXE) != 0u) {
+            if (index < sizeof(s_data)) {
+                I2C1->DR = std::bit_cast<std::uint8_t *>(&s_data)[index++];
+            } else {
+                I2C1->DR = 0xff;
+            }
+        }
+    }
+
+    // TODO: Stop set?
+    I2C1->SR1 &= ~I2C_SR1_STOPF;
+    I2C1->CR1 |= I2C_CR1_PE;
+
+    return std::nullopt;
+}
+
+void spi_transfer(const hal::Gpio &cs, std::span<std::uint8_t> data) {
+    // Pull CS low and create a scope guard to pull it high again on return.
+    // TODO: Add timeouts.
+    util::ScopeGuard cs_guard([&cs] {
+        hal::gpio_set(cs);
+    });
+    hal::gpio_reset(cs);
+
+    // Transmit each byte one-by-one.
     for (auto &byte : data) {
         // Transmit byte.
-        hal::wait_equal(SPI2->SR, SPI_SR_TXE, SPI_SR_TXE);
+        while ((SPI2->SR & SPI_SR_TXE) != SPI_SR_TXE) {
+            __NOP();
+        }
+        // hal::wait_equal(SPI2->SR, SPI_SR_TXE, SPI_SR_TXE);
         SPI2->DR = byte;
 
         // Receive byte.
-        hal::wait_equal(SPI2->SR, SPI_SR_RXNE, SPI_SR_RXNE);
+        while ((SPI2->SR & SPI_SR_RXNE) != SPI_SR_RXNE) {
+            __NOP();
+        }
+        // hal::wait_equal(SPI2->SR, SPI_SR_RXNE, SPI_SR_RXNE);
         byte = SPI2->DR;
     }
 
     // Wait for busy to be clear and then reset CS to high.
-    hal::wait_equal(SPI2->SR, SPI_SR_BSY, 0u);
+    while ((SPI2->SR & SPI_SR_BSY) != 0u) {
+        __NOP();
+    }
+    // hal::wait_equal(SPI2->SR, SPI_SR_BSY, 0u);
 }
 
 std::uint16_t adc_sample_raw() {
@@ -97,11 +145,11 @@ std::uint16_t adc_sample_raw() {
     return (static_cast<std::uint16_t>(bytes[0]) << 8u) | bytes[1];
 }
 
-std::pair<std::uint16_t, std::uint16_t> adc_sample_voltage(std::uint32_t sample_count) {
+std::pair<std::uint16_t, std::uint16_t> adc_sample_voltage(std::size_t sample_count) {
     std::uint16_t min_value = std::numeric_limits<std::uint16_t>::max();
     std::uint16_t max_value = 0;
     std::uint32_t sum = 0;
-    for (std::uint32_t i = 0; i < sample_count; i++) {
+    for (std::size_t i = 0; i < sample_count; i++) {
         const auto value = adc_sample_raw();
         min_value = std::min(min_value, value);
         max_value = std::max(max_value, value);
@@ -139,31 +187,23 @@ AfeStatus afe_command(std::uint16_t balance_bits, std::uint8_t control_bits) {
 }
 
 void sample_cell_voltage(std::uint8_t index) {
+    // Select cell for output on AOUT in hold mode. The level shift and AOUT settle delay should pass before the first
+    // ADC acquisition occurs.
     constexpr std::array<std::uint8_t, 12> index_table{
         0b10000000, 0b11000000, 0b10100000, 0b11100000, 0b10010000, 0b11010000,
         0b10110000, 0b11110000, 0b10001000, 0b11001000, 0b10101000, 0b11101000,
     };
-
-    // Deselect hold mode.
-    afe_command(0u, 0b10000000u);
-
-    // Select cell for output on AOUT.
     afe_command(0u, index_table[index] | 0b100u);
 
-    // Wait for level shift and AOUT settle (50 us).
-    // TODO: Measure this.
-    for (std::uint32_t i = 0; i < 50; i++) {
-        __NOP();
-    }
-
-    const auto [voltage, adc_range] = adc_sample_voltage(k_adc_sample_count);
-    hal::swd_printf("v%u: [%u, %u]\n", index + 1, voltage, adc_range);
+    const auto [voltage, adc_range] = adc_sample_voltage(k_cell_sample_count);
+    s_data.voltages[index] = voltage;
+    // hal::swd_printf("v%u: [%u, %u]\n", index + 1, voltage, adc_range);
 }
 
 void sample_thermistors(std::uint16_t reference_voltage) {
     std::uint32_t bitset = 0;
     std::array<std::uint8_t, 23> temperatures;
-    for (std::uint32_t index = 0; index < k_max_thermistor_count; index++) {
+    for (std::size_t index = 0; index < k_max_thermistor_count; index++) {
         // Enable the MOSFET.
         GPIOA->ODR = 1u << (index / 3);
 
@@ -175,12 +215,11 @@ void sample_thermistors(std::uint16_t reference_voltage) {
         afe_command(0u, selection_bits);
 
         // Wait for settle (5 us).
-        for (std::uint32_t i = 0; i < 10; i++) {
+        for (std::uint32_t i = 0; i < 1000; i++) {
             __NOP();
         }
 
-        const auto adc_value = adc_sample_raw();
-        const auto voltage = (adc_value * 45000u) >> 16u;
+        const auto voltage = adc_sample_voltage(k_thermistor_sample_count).first;
         if (std::abs(static_cast<std::int32_t>(voltage) - reference_voltage) > k_thermistor_range_threshold) {
             // Thermistor is connected.
             bitset |= 1u << index;
@@ -192,19 +231,21 @@ void sample_thermistors(std::uint16_t reference_voltage) {
             }
             float t0 = 1.0f / 298.15f;
             float temperature = 1.0f / (t0 + beta * std::log(static_cast<float>(resistance) / 10000.0f)) - 273.15f;
-            temperatures[index] = static_cast<std::uint32_t>(temperature);
+            s_data.temperatures[index] = static_cast<std::uint32_t>(temperature);
         }
     }
 
     // Disable all MOSFETs.
     GPIOA->ODR = 0u;
 
-    hal::swd_printf("%u thermistors connected\n", std::popcount(bitset));
-    for (std::uint32_t index = 0; index < k_max_thermistor_count; index++) {
-        if ((bitset & (1u << index)) != 0u) {
-            hal::swd_printf("t%u: %u\n", index, temperatures[index]);
-        }
-    }
+    s_data.thermistor_bitset = bitset;
+
+    // hal::swd_printf("%u thermistors connected\n", std::popcount(bitset));
+    // for (std::uint32_t index = 0; index < k_max_thermistor_count; index++) {
+    //     if ((bitset & (1u << index)) != 0u) {
+    //         hal::swd_printf("t%u: %u\n", index, temperatures[index]);
+    //     }
+    // }
 }
 
 } // namespace
@@ -228,6 +269,9 @@ void app_main() {
     s_afe_cs.configure(hal::GpioOutputMode::PushPull, hal::GpioOutputSpeed::Max2);
     s_miso.configure(hal::GpioInputMode::PullUp);
 
+    // Configure SDA for I2C. The configuration for SDA never changes, only SCL does.
+    s_sda.configure(hal::GpioOutputMode::AlternateOpenDrain, hal::GpioOutputSpeed::Max2);
+
     // Enable clocks for I2C1 and SPI2.
     RCC->APB1ENR |= RCC_APB1ENR_I2C1EN | RCC_APB1ENR_SPI2EN;
 
@@ -236,52 +280,104 @@ void app_main() {
     EXTI->EMR |= EXTI_EMR_MR6;
     EXTI->FTSR |= EXTI_FTSR_TR6;
 
+    // Configure I2C.
+    // TODO: Don't hardcode I2C address.
+    I2C1->OAR1 = 0x58u << 1u;
+    I2C1->CR2 = 8u;
+
+    std::uint16_t rail_voltage = 0;
+    std::uint16_t rail_noise = 0;
     while (true) {
+        // Disable I2C and SPI peripherals. No need to disable clocks as they turn off in stop mode anyway.
+        I2C1->CR1 &= ~I2C_CR1_PE;
+        SPI2->CR1 &= ~SPI_CR1_SPE;
+
         // Reconfigure SCK and MOSI as regular GPIOs before going to sleep.
         s_sck.configure(hal::GpioOutputMode::PushPull, hal::GpioOutputSpeed::Max2);
         s_mosi.configure(hal::GpioOutputMode::PushPull, hal::GpioOutputSpeed::Max2);
 
-        // Pull CS lines high by default (active-low) and put the ADC, AFE, and reference into shutdown.
+        // Pull CS lines high by default (active-low) and put the ADC into shutdown.
         hal::gpio_set(s_adc_cs, s_afe_cs, s_sck);
-        hal::gpio_reset(s_adc_cs, s_afe_en, s_ref_en);
+        hal::gpio_reset(s_adc_cs);
         hal::gpio_set(s_adc_cs);
 
         // Reconfigure SCL as a regular input for use as an external event and enter stop mode.
         s_scl.configure(hal::GpioInputMode::Floating);
         hal::enter_stop_mode();
 
-        // Wake the ADC and enable the AFE and reference.
-        hal::gpio_reset(s_sck, s_adc_cs);
-        hal::gpio_set(s_adc_cs, s_afe_cs, s_afe_en, s_ref_en);
+        // Configure SCL for use with the I2C peripheral.
+        s_scl.configure(hal::GpioOutputMode::AlternateOpenDrain, hal::GpioOutputSpeed::Max2);
 
-        // Configure SCK and MOSI for use with SPI peripheral.
+        I2C1->CR1 |= I2C_CR1_ACK | I2C_CR1_PE;
+
+        // Wait a maximum of 10 ms for address match.
+        // TODO: Time this better.
+        for (std::uint32_t timeout = 10000; timeout != 0; timeout--) {
+            if ((I2C1->SR1 & I2C_SR1_ADDR) != 0u) {
+                break;
+            }
+            for (std::uint32_t i = 0; i < 10; i++) {
+                __NOP();
+            }
+        }
+
+        const auto request = i2c_receive();
+        if (!request) {
+            // Data not for us or spurious wakeup - go back to sleep.
+            continue;
+        }
+
+        switch (*request) {
+            using enum bms::Request;
+        case Enable:
+            hal::gpio_set(s_afe_en, s_ref_en);
+            break;
+        case Disable:
+            hal::gpio_reset(s_afe_en, s_ref_en);
+            break;
+        default:
+            break;
+        }
+
+        if (*request != bms::Request::MeasureRail && *request != bms::Request::Sample) {
+            // Bad request.
+            continue;
+        }
+
+        // TODO: Should probably check that the AFE and reference are on.
+
+        // Wake the ADC.
+        hal::gpio_reset(s_sck, s_adc_cs);
+        hal::gpio_set(s_adc_cs, s_afe_cs);
+
+        // Configure SCK and MOSI for use with the SPI peripheral.
         s_sck.configure(hal::GpioOutputMode::AlternatePushPull, hal::GpioOutputSpeed::Max10);
         s_mosi.configure(hal::GpioOutputMode::AlternatePushPull, hal::GpioOutputSpeed::Max10);
 
         // Enable SPI2 in master mode at 2 MHz (4x divider).
         SPI2->CR1 = SPI_CR1_SSM | SPI_CR1_SSI | SPI_CR1_SPE | SPI_CR1_BR_0 | SPI_CR1_MSTR;
 
-        // Wait for AFE startup to complete.
-        while (afe_command(0, 0) == AfeStatus::NotReady) {
+        // Wait for AFE startup to complete. Route T1 (buffered) by default.
+        while (afe_command(0, 0b01011000u) == AfeStatus::NotReady) {
             __NOP();
         }
 
-        // Wait 100 ms for sampling and reference comeup.
-        for (std::uint32_t i = 0; i < 400000; i++) {
-            __NOP();
+        if (*request == bms::Request::MeasureRail) {
+            // All thermistors are switched off so we can measure the 3V3 rail voltage.
+            std::tie(rail_voltage, rail_noise) = adc_sample_voltage(k_rail_sample_count);
+            hal::swd_printf("3v3 rail: [%u, %u]\n", rail_voltage, rail_noise);
+        } else {
+            // Sample all thermistors. Doing this first allows the sampling capacitors to top up a bit.
+            sample_thermistors(rail_voltage);
+
+            // Sample all cells in order of most potential to least potential (w.r.t. ground).
+            for (std::uint32_t cell = 12; cell > 0; cell--) {
+                sample_cell_voltage(cell - 1);
+            }
+
+            afe_command(0u, 0b01011010u);
         }
 
-        // Route T1 (buffered) with all thermistors switched off to measure the 3V3 voltage.
-        afe_command(0u, 0b01011000u);
-        const auto [rail_voltage, rail_noise] = adc_sample_voltage(128);
-        hal::swd_printf("3v3 rail: [%u, %u]\n", rail_voltage, rail_noise);
-
-        // Sample all thermistors.
-        sample_thermistors(rail_voltage);
-
-        // Sample all cells.
-        for (std::uint32_t cell = 12; cell > 0; cell--) {
-            sample_cell_voltage(cell - 1);
-        }
+        s_data.rail_voltage = rail_voltage;
     }
 }
