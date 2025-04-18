@@ -8,6 +8,22 @@
 
 namespace util {
 
+template <typename Callback>
+class ScopeGuard {
+    const Callback m_callback;
+
+public:
+    ScopeGuard(Callback &&callback) : m_callback(std::move(callback)) {}
+    ScopeGuard(const ScopeGuard &) = delete;
+    ScopeGuard(ScopeGuard &&) = delete;
+    ~ScopeGuard() {
+        m_callback();
+    }
+
+    ScopeGuard &operator=(const ScopeGuard &) = delete;
+    ScopeGuard &operator=(ScopeGuard &&) = delete;
+};
+
 /**
  * Clamps the given value to the range [min_value, max_value].
  *
