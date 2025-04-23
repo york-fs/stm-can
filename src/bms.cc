@@ -74,8 +74,11 @@ std::optional<bms::Command> i2c_handle(const bms::SegmentData &data) {
     // Check if master is sending us a command.
     if ((sr2 & I2C_SR2_TRA) == 0u) {
         // Receive the single command byte.
+        std::uint32_t timeout = 200;
         while ((I2C1->SR1 & I2C_SR1_RXNE) == 0u) {
-            __NOP();
+            if (--timeout == 0) {
+                return std::nullopt;
+            }
         }
         return static_cast<bms::Command>(I2C1->DR);
     }
@@ -100,23 +103,27 @@ std::optional<bms::Command> i2c_handle(const bms::SegmentData &data) {
 
     // TODO: Rewrite this.
     std::uint32_t index = 0;
-    while ((I2C1->SR1 & I2C_SR1_STOPF) == 0u) {
+    std::uint32_t timeout = 100;
+    while (true) {
         if ((I2C1->SR1 & I2C_SR1_AF) != 0u) {
             // NACK received.
             I2C1->SR1 &= ~I2C_SR1_AF;
             break;
         }
 
+        if (--timeout == 0) {
+            break;
+        }
+
         if ((I2C1->SR1 & I2C_SR1_TXE) != 0u) {
             if (index < bytes.size()) {
                 I2C1->DR = bytes[index++];
+                timeout = 100;
             } else {
                 I2C1->DR = 0xff;
             }
         }
     }
-    I2C1->SR1 &= ~I2C_SR1_STOPF;
-    I2C1->CR1 |= I2C_CR1_PE;
     return std::nullopt;
 }
 
